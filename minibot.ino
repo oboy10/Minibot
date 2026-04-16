@@ -1,130 +1,163 @@
-// TwoWheelBot_PWM
-// RC Controller to 2-Motor Drive Control (Tank-Style Independent)
-// Left Stick  (Elevator) = Left  Motor (Back Left Wheel)
-// Right Stick (Aileron)  = Right Motor (Back Right Wheel)
-// Front roller is passive — no motor control needed
-
-/*
-PWM Pulse Value Limits for REV SparkMAX:
-- Full Reverse:  1000 microseconds
-- Neutral:       1500 microseconds
-- Full Forward:  2000 microseconds
-
-Wiring:
-  RC Receiver → Arduino
-  Elev  → Pin 1  (Left  stick up/down  → Left  motor)
-  Aile  → Pin 0  (Right stick up/down  → Right motor)
-
-  SparkMAX PWM signals:
-  Left  Motor → Pin 10
-  Right Motor → Pin 11
-
-Motor inversion:
-  If one side drives backward when it should go forward,
-  flip its INVERT flag below.
-*/
-
+// TwoWheelBot_PWM - FINAL
 #include <Servo.h>
 
-// RC Receiver Input Pins
-#define AILE_PIN    0   // Right stick up/down
-#define ELEV_PIN    1   // Left  stick up/down
-#define THRO_PIN    2
-#define RUDD_PIN    3
-#define RIGHT_PIN   4
-#define BUTTON_PIN  5
-#define LEFT_PIN    6
-#define SCROLL_PIN  7
 
-// Motor Output Pins
-#define MOTOR_LEFT_PIN  10
-#define MOTOR_RIGHT_PIN 11
+#define LEFT_MOTOR_CH   3
+#define RIGHT_MOTOR_CH  2
+#define MOTOR_LEFT_PIN  11
+#define MOTOR_RIGHT_PIN 12
 
-// Tuning
-#define DEADBAND      30     // Ignore stick noise within ±30µs of center
-#define INVERT_LEFT   false  // Flip if left  motor drives wrong direction
-#define INVERT_RIGHT  true   // Flip if right motor drives wrong direction
-                             // (right side is often physically mirrored)
 
-#define NEUTRAL 1500
+#define LEFT_NEUTRAL  1488
+#define RIGHT_NEUTRAL 1600
+
+
+#define DEADBAND_LEFT  50
+#define DEADBAND_RIGHT 30   // Small deadband just to prevent drift
+#define SMOOTH_FACTOR  4
+#define KICK_AMOUNT    150  // Only used for LEFT motor now
+#define KICK_DURATION  200
+#define SIGNAL_TIMEOUT_MS 100
+
 
 Servo motorLeft, motorRight;
 
-// Apply deadband around 1500 center
-int applyDeadband(int val, int deadband) {
-  if (val == 0) return NEUTRAL;              // No signal guard
-  int offset = val - NEUTRAL;
-  if (abs(offset) < deadband) return NEUTRAL;
-  return val;
+
+volatile unsigned long elevRiseTime = 0, aileRiseTime = 0;
+volatile int elevValue = LEFT_NEUTRAL, aileValue = RIGHT_NEUTRAL;
+volatile unsigned long elevLastTime = 0, aileLastTime = 0;
+
+
+void elevISR() {
+  if (digitalRead(LEFT_MOTOR_CH) == HIGH) elevRiseTime = micros();
+  else {
+    int p = (int)(micros() - elevRiseTime);
+    if (p > 800 && p < 2200) { elevValue = p; elevLastTime = millis(); }
+  }
 }
 
-// Invert a PWM value around neutral
-int invertPWM(int val) {
-  return NEUTRAL - (val - NEUTRAL);
+
+void aileISR() {
+  if (digitalRead(RIGHT_MOTOR_CH) == HIGH) aileRiseTime = micros();
+  else {
+    int p = (int)(micros() - aileRiseTime);
+    if (p > 800 && p < 2200) { aileValue = p; aileLastTime = millis(); }
+  }
 }
 
-void setMotor(Servo &motor, int pwmValue, bool invert) {
-  pwmValue = constrain(pwmValue, 1000, 2000);
-  if (invert) pwmValue = invertPWM(pwmValue);
-  motor.writeMicroseconds(pwmValue);
+
+int remapLeft(int val) {
+  return map(val, 1000, 1976, 2000, 1000);
 }
+
+
+int remapRight(int val) {
+  return map(val, 1990, 1000, 2000, 1000);
+}
+
+
+void setMotor(Servo &motor, int pwm) {
+  motor.writeMicroseconds(constrain(pwm, 1000, 2000));
+}
+
 
 void stopAll() {
-  motorLeft.writeMicroseconds(NEUTRAL);
-  motorRight.writeMicroseconds(NEUTRAL);
+  motorLeft.writeMicroseconds(LEFT_NEUTRAL);
+  motorRight.writeMicroseconds(RIGHT_NEUTRAL);
 }
+
 
 void setup() {
-  Serial.begin(9600);
-
-  // RC input pins
-  pinMode(AILE_PIN,   INPUT);
-  pinMode(ELEV_PIN,   INPUT);
-  pinMode(THRO_PIN,   INPUT);
-  pinMode(RUDD_PIN,   INPUT);
-  pinMode(RIGHT_PIN,  INPUT);
-  pinMode(BUTTON_PIN, INPUT);
-  pinMode(LEFT_PIN,   INPUT);
-  pinMode(SCROLL_PIN, INPUT);
-
-  // Attach motors to PWM pins
+  Serial.begin(115200);
   motorLeft.attach(MOTOR_LEFT_PIN);
   motorRight.attach(MOTOR_RIGHT_PIN);
-
-  // Neutral on startup — required for SparkMAX to arm
   stopAll();
-  delay(2000);
 
-  Serial.println("2-Wheel Bot Ready.");
-  Serial.println("Left stick (Elev) → Left Motor | Right stick (Aile) → Right Motor");
+
+  Serial.println("Arming SparkMAX...");
+  unsigned long s = millis();
+  while (millis() - s < 3000) { stopAll(); delay(20); }
+
+
+  pinMode(LEFT_MOTOR_CH,  INPUT_PULLUP);
+  pinMode(RIGHT_MOTOR_CH, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(LEFT_MOTOR_CH),  elevISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(RIGHT_MOTOR_CH), aileISR, CHANGE);
+
+
+  Serial.println("=== Bot Ready ===");
 }
+
+
+float smoothL = LEFT_NEUTRAL, smoothR = RIGHT_NEUTRAL;
+bool lwas = true;
+unsigned long lkick = 0;
+
 
 void loop() {
-  // Read RC channels (25ms timeout prevents blocking on lost signal)
-  int elevValue = pulseIn(ELEV_PIN, HIGH, 25000);  // Left  stick vertical
-  int aileValue = pulseIn(AILE_PIN, HIGH, 25000);  // Right stick vertical
+  noInterrupts();
+  int lr = elevValue, rr = aileValue;
+  unsigned long la = millis() - elevLastTime;
+  unsigned long ra = millis() - aileLastTime;
+  interrupts();
 
-  // Lost signal — stop motors
-  if (elevValue == 0 && aileValue == 0) {
-    stopAll();
-    Serial.println("No RC signal — motors stopped.");
-    delay(20);
-    return;
-  }
 
-  // Apply deadband to remove center stick drift
-  int leftSpeed  = applyDeadband(elevValue, DEADBAND);
-  int rightSpeed = applyDeadband(aileValue, DEADBAND);
+  if (la > SIGNAL_TIMEOUT_MS) lr = LEFT_NEUTRAL;
+  if (ra > SIGNAL_TIMEOUT_MS) rr = RIGHT_NEUTRAL;
+  if (lr < 800 || lr > 2200) lr = LEFT_NEUTRAL;
+  if (rr < 800 || rr > 2200) rr = RIGHT_NEUTRAL;
 
-  // Drive each motor independently
-  setMotor(motorLeft,  leftSpeed,  INVERT_LEFT);
-  setMotor(motorRight, rightSpeed, INVERT_RIGHT);
 
-  // Debug
-  Serial.print("Left Stick: ");  Serial.print(elevValue);
-  Serial.print(" → L_PWM: ");   Serial.print(leftSpeed);
-  Serial.print(" | Right Stick: "); Serial.print(aileValue);
-  Serial.print(" → R_PWM: ");   Serial.println(rightSpeed);
+  int lRemapped = remapLeft(lr);
+  int rRemapped = remapRight(rr);
 
-  delay(20);
+
+  // Deadbands
+  int lt = (abs(lRemapped - LEFT_NEUTRAL)  < DEADBAND_LEFT)  ? LEFT_NEUTRAL  : lRemapped;
+  int rt = (abs(rRemapped - RIGHT_NEUTRAL) < DEADBAND_RIGHT) ? RIGHT_NEUTRAL : rRemapped;
+
+
+  // Kick-start LEFT only
+  if (lt != LEFT_NEUTRAL && lwas) { lkick = millis(); lwas = false; }
+  if (lt == LEFT_NEUTRAL) lwas = true;
+  if (lt != LEFT_NEUTRAL && (millis() - lkick) < KICK_DURATION)
+    lt = constrain(lt + ((lt > LEFT_NEUTRAL) ? 1 : -1) * KICK_AMOUNT, 1000, 2000);
+
+
+  // RIGHT motor: no kick, direct smooth
+  smoothL += (lt - smoothL) / SMOOTH_FACTOR;
+  smoothR += (rt - smoothR) / SMOOTH_FACTOR;
+
+
+  if (abs(smoothL - LEFT_NEUTRAL)  < 5) smoothL = LEFT_NEUTRAL;
+  if (abs(smoothR - RIGHT_NEUTRAL) < 5) smoothR = RIGHT_NEUTRAL;
+
+
+  setMotor(motorLeft,  (int)smoothL);
+  setMotor(motorRight, (int)smoothR);
+
+
+  Serial.print("L_Raw:"); Serial.print(lr);
+  Serial.print(" L_Out:"); Serial.print((int)smoothL);
+  Serial.print(" | R_Raw:"); Serial.print(rr);
+  Serial.print(" R_Mapped:"); Serial.print(rRemapped);
+  Serial.print(" R_Out:"); Serial.print((int)smoothR);
+  Serial.print(" [L:");
+  if      (smoothL > LEFT_NEUTRAL  + 5) Serial.print("FWD");
+  else if (smoothL < LEFT_NEUTRAL  - 5) Serial.print("REV");
+  else                                   Serial.print("STP");
+  Serial.print(" R:");
+  if      (smoothR > RIGHT_NEUTRAL + 5) Serial.print("FWD");
+  else if (smoothR < RIGHT_NEUTRAL - 5) Serial.print("REV");
+  else                                   Serial.print("STP");
+  Serial.println("]");
+
+
+  delay(30);
 }
+
+
+
+
+
+
